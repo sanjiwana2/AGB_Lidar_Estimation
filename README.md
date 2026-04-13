@@ -14,7 +14,6 @@ It provides a unified framework for training and comparing shallow learning mode
 - 1D and 2D CNN architectures for LiDAR feature learning
 - Attention-enhanced CNN models (Squeeze-and-Excitation)
 - KAN-based neural network architectures
-- Residual CNN-KAN hybrid models
 - Modular model registry for easy experimentation
 - Supports regression-based AGB prediction
 
