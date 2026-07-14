@@ -2,8 +2,30 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Import the efficient-kan implementation (must be saved as efficient_kan.py)
+from Model.efficient_KAN import KAN
+
+
 # ==========================================
-# 🔥 SE BLOCKS
+# 🔧 GLOBAL UTILITY FUNCTIONS
+# ==========================================
+
+def safe_input_size(input_size):
+    """Extracts the last element if input_size is a tuple/list."""
+    return input_size[-1] if isinstance(input_size, (tuple, list)) else input_size
+
+
+def compute_flattened_size(network, input_shape):
+    """Dynamically computes the flattened feature size after forward pass."""
+    device = next(network.parameters()).device
+    with torch.no_grad():
+        dummy_input = torch.zeros(2, *input_shape).to(device)
+        output = network(dummy_input)
+        return output.view(2, -1).size(1)
+
+
+# ==========================================
+# 🧠 SQUEEZE-AND-EXCITATION (SE) BLOCKS
 # ==========================================
 
 class SEBlock1D(nn.Module):
@@ -17,10 +39,9 @@ class SEBlock1D(nn.Module):
         )
 
     def forward(self, x):
-        b, c, l = x.size()
+        b, c, _ = x.size()
         y = x.mean(dim=2)
-        y = self.fc(y).view(b, c, 1)
-        return x * y
+        return x * self.fc(y).view(b, c, 1)
 
 
 class SEBlock2D(nn.Module):
@@ -34,221 +55,87 @@ class SEBlock2D(nn.Module):
         )
 
     def forward(self, x):
-        b, c, h, w = x.size()
+        b, c, _, _ = x.size()
         y = x.mean(dim=(2, 3))
-        y = self.fc(y).view(b, c, 1, 1)
-        return x * y
+        return x * self.fc(y).view(b, c, 1, 1)
 
 
 # ==========================================
-# 🔥 IMPROVED KAN LAYER (STABLE)
-# ==========================================
-
-class KANLayer(nn.Module):
-    def __init__(self, in_features, out_features, hidden=128):
-        super().__init__()
-
-        self.net = nn.Sequential(
-            nn.Linear(in_features, hidden),
-            nn.LayerNorm(hidden),   # 🔥 stabilizer
-            nn.SiLU(),
-
-            nn.Linear(hidden, hidden),
-            nn.LayerNorm(hidden),
-            nn.SiLU(),
-
-            nn.Linear(hidden, out_features)
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-# ==========================================
-# 🔧 HELPER FUNCTION (CRITICAL FIX)
-# ==========================================
-
-def safe_input_size(input_size):
-    if isinstance(input_size, tuple):
-        return input_size[-1]
-    return input_size
-
-
-# ==========================================
-# 🚀 1D CNN (NO SE)
+# 🚀 KAN & CNN-KAN ARCHITECTURES
 # ==========================================
 
 class CNN1D_KAN(nn.Module):
-    def __init__(self, input_size, num_classes=1):
+    def __init__(self, input_size, num_classes=1, kan_hidden=128, use_se=True, grid_size=5, spline_order=3, dropout=0.3):
         super().__init__()
-
+        
         input_size = safe_input_size(input_size)
+        
+        # Build 1D Convolutional Back-bone pipeline
+        modules = []
+        configs = [(1, 128), (128, 256), (256, 512)]
+        
+        for in_ch, out_ch in configs:
+            modules.extend([
+                nn.Conv1d(in_ch, out_ch, kernel_size=3, padding=1),
+                nn.BatchNorm1d(out_ch),
+                nn.ReLU(),
+            ])
+            if use_se:
+                modules.append(SEBlock1D(out_ch))
+            modules.extend([
+                nn.MaxPool1d(2),
+                nn.Dropout(dropout)
+            ])
+            
+        self.cnn = nn.Sequential(*modules)
+        
+        # Calculate dynamic shapes safely
+        self.flattened_size = compute_flattened_size(self.cnn, (1, input_size))
+        
+        self.kan = KAN(
+            layers_hidden=[self.flattened_size, kan_hidden, num_classes],
+            grid_size=grid_size,
+            spline_order=spline_order
+        )
 
-        self.conv1 = nn.Conv1d(1, 128, 3, padding=1)
-        self.bn1 = nn.BatchNorm1d(128)
-        self.pool1 = nn.MaxPool1d(2)
-        self.drop1 = nn.Dropout(0.3)
+    def forward(self, x, update_grid=False):
+        if x.dim() == 2:
+            x = x.unsqueeze(1)  # Add channel dimension if missing: (B, L) -> (B, 1, L)
+        x = self.cnn(x)
+        x = x.flatten(1)
+        return self.kan(x, update_grid=update_grid)
 
-        self.conv2 = nn.Conv1d(128, 256, 3, padding=1)
-        self.bn2 = nn.BatchNorm1d(256)
-        self.pool2 = nn.MaxPool1d(2)
-        self.drop2 = nn.Dropout(0.3)
-
-        self.conv3 = nn.Conv1d(256, 512, 3, padding=1)
-        self.bn3 = nn.BatchNorm1d(512)
-        self.pool3 = nn.MaxPool1d(2)
-        self.drop3 = nn.Dropout(0.3)
-
-        self.flattened_size = self._get_flattened_size(input_size)
-        self.kan = KANLayer(self.flattened_size, num_classes)
-
-    def _get_flattened_size(self, input_size):
-        device = next(self.parameters()).device
-        with torch.no_grad():
-            x = torch.zeros(2, 1, input_size).to(device)
-            x = self.pool1(F.relu(self.bn1(self.conv1(x))))
-            x = self.pool2(F.relu(self.bn2(self.conv2(x))))
-            x = self.pool3(F.relu(self.bn3(self.conv3(x))))
-            return x.view(2, -1).size(1)
-
-    def forward(self, x):
-        x = x.unsqueeze(1)
-        x = self.pool1(F.relu(self.bn1(self.conv1(x))))
-        x = self.drop1(x)
-        x = self.pool2(F.relu(self.bn2(self.conv2(x))))
-        x = self.drop2(x)
-        x = self.pool3(F.relu(self.bn3(self.conv3(x))))
-        x = self.drop3(x)
-        x = x.view(x.size(0), -1)
-        return self.kan(x)
-
-
-# ==========================================
-# 🚀 1D CNN (WITH SE)
-# ==========================================
-
-class CNN1D_KAN_SE(nn.Module):
-    def __init__(self, input_size, num_classes=1):
-        super().__init__()
-
-        input_size = safe_input_size(input_size)
-
-        self.conv1 = nn.Conv1d(1, 128, 3, padding=1)
-        self.bn1 = nn.BatchNorm1d(128)
-        self.se1 = SEBlock1D(128)
-        self.pool1 = nn.MaxPool1d(2)
-
-        self.conv2 = nn.Conv1d(128, 256, 3, padding=1)
-        self.bn2 = nn.BatchNorm1d(256)
-        self.se2 = SEBlock1D(256)
-        self.pool2 = nn.MaxPool1d(2)
-
-        self.conv3 = nn.Conv1d(256, 512, 3, padding=1)
-        self.bn3 = nn.BatchNorm1d(512)
-        self.se3 = SEBlock1D(512)
-        self.pool3 = nn.MaxPool1d(2)
-
-        self.flattened_size = self._get_flattened_size(input_size)
-        self.kan = KANLayer(self.flattened_size, num_classes)
-
-    def _get_flattened_size(self, input_size):
-        device = next(self.parameters()).device
-        with torch.no_grad():
-            x = torch.zeros(2, 1, input_size).to(device)
-            x = self.pool1(self.se1(F.relu(self.bn1(self.conv1(x)))))
-            x = self.pool2(self.se2(F.relu(self.bn2(self.conv2(x)))))
-            x = self.pool3(self.se3(F.relu(self.bn3(self.conv3(x)))))
-            return x.view(2, -1).size(1)
-
-    def forward(self, x):
-        x = x.unsqueeze(1)
-        x = self.pool1(self.se1(F.relu(self.bn1(self.conv1(x)))))
-        x = self.pool2(self.se2(F.relu(self.bn2(self.conv2(x)))))
-        x = self.pool3(self.se3(F.relu(self.bn3(self.conv3(x)))))
-        x = x.view(x.size(0), -1)
-        return self.kan(x)
-
-
-# ==========================================
-# 🚀 2D CNN (NO SE)
-# ==========================================
 
 class CNN2D_KAN(nn.Module):
-    def __init__(self, input_size=(1, 12, 62), num_classes=1):
+    def __init__(self, input_size=(1, 12, 62), num_classes=1, kan_hidden=128, use_se=False, grid_size=5, spline_order=3):
         super().__init__()
 
-        self.cnn = nn.Sequential(
-            nn.Conv2d(1, 64, 3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
+        # Build 2D Convolutional Back-bone pipeline
+        modules = []
+        configs = [(1, 64), (64, 128), (128, 256)]
+        
+        for in_ch, out_ch in configs:
+            modules.extend([
+                nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
+                nn.BatchNorm2d(out_ch),
+                nn.ReLU()
+            ])
+            if use_se:
+                modules.append(SEBlock2D(out_ch))
+            modules.append(nn.MaxPool2d(2))
 
-            nn.Conv2d(64, 128, 3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-
-            nn.Conv2d(128, 256, 3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
-            nn.MaxPool2d(2)
+        self.cnn = nn.Sequential(*modules)
+        
+        # Calculate dynamic shapes safely
+        self.flattened_size = compute_flattened_size(self.cnn, input_size)
+        
+        self.kan = KAN(
+            layers_hidden=[self.flattened_size, kan_hidden, num_classes],
+            grid_size=grid_size,
+            spline_order=spline_order
         )
 
-        self.flattened_size = self._get_flattened_size(input_size)
-        self.kan = KANLayer(self.flattened_size, num_classes)
-
-    def _get_flattened_size(self, shape):
-        device = next(self.parameters()).device
-        with torch.no_grad():
-            x = torch.zeros(2, *shape).to(device)
-            x = self.cnn(x)
-            return x.view(2, -1).size(1)
-
-    def forward(self, x):
+    def forward(self, x, update_grid=False):
         x = self.cnn(x)
         x = x.view(x.size(0), -1)
-        return self.kan(x)
-
-
-# ==========================================
-# 🚀 2D CNN (WITH SE)
-# ==========================================
-
-class CNN2D_KAN_SE(nn.Module):
-    def __init__(self, input_size=(1, 12, 62), num_classes=1):
-        super().__init__()
-
-        self.cnn = nn.Sequential(
-            nn.Conv2d(1, 64, 3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            SEBlock2D(64),
-            nn.MaxPool2d(2),
-
-            nn.Conv2d(64, 128, 3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            SEBlock2D(128),
-            nn.MaxPool2d(2),
-
-            nn.Conv2d(128, 256, 3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
-            SEBlock2D(256),
-            nn.MaxPool2d(2)
-        )
-
-        self.flattened_size = self._get_flattened_size(input_size)
-        self.kan = KANLayer(self.flattened_size, num_classes)
-
-    def _get_flattened_size(self, shape):
-        device = next(self.parameters()).device
-        with torch.no_grad():
-            x = torch.zeros(2, *shape).to(device)
-            x = self.cnn(x)
-            return x.view(2, -1).size(1)
-
-    def forward(self, x):
-        x = self.cnn(x)
-        x = x.view(x.size(0), -1)
-        return self.kan(x)
+        return self.kan(x, update_grid=update_grid)
